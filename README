@@ -1,0 +1,108 @@
+				CSE 506 HW1
+			        Junxing Yang
+				Feb 22, 2012.
+Overview
+--------
+I've done the basic part of the project, EXTRA CREDIT A and part of B and C. 
+What I have not done yet is how to make the following 3 ciphers work: des, des3_ebe and camellia. 
+Also, the program cannot handle block size bigger that PAGE_SIZE due to the limit of the padding method.
+
+Files submitted
+---------------
+- xcrypt.c:	kernel module code which implements the system call
+- xcipher.c:	user-level code which calls the system call 
+- xcrypt.h:	common header file used by both .c file
+- Makefile:	makefile to generate module "xcrypt.ko" 
+		and user-level program "xcipher"
+
+SYSCALL implementation
+----------------------
+- Add the following code to arch/x86/kernel/syscall_table_32.S: .long sys_xcrypt
+- Add the following code to arch/x86/include/asm/unistd_32.h: #define __NR_xcrypt  349
+  Modify: #define NR_syscalls  350
+- Add the following code to fs/read_write.c:
+	asmlinkage long (*xcryptfxn) (void *args) = NULL;
+	EXPORT_SYMBOL(xcryptfxn);
+	asmlinkage long sys_xcrypt(void *args)
+	{
+		if(xcryptfxn == NULL)
+			return -ENOSYS;
+		return xcryptfxn(args);
+	}
+	EXPORT_SYMBOL(sys_xcrypt);
+- Declare function sys_xcrypt in arch/x86/include/asm/syscalls.h
+- recompile the kernel.
+
+Design decisions
+----------------
+@USER LEVEL:
+(1) KEY:
+use function int PKCS5_PBKDF2_HMAC_SHA1(const char *pass, int passlen, 
+                                   unsigned char *salt, int saltlen, int iter, 
+                                   int keylen, unsigned char *out); 
+from OPENSSL to generate key in arbitrary length (Default value is 16 bytes).
+
+(2) ARGUMENTS:
+Use getopt(3) to get the arguments. Use function filter_copy() to delete '\n' from password.
+Check whether the arguments are right:
+- must specify -e or -d and only one of them
+- whether input file exists
+- if output file exists, ask user whether to overwrite or not
+- whether password, input file name, output file name are null
+(EXTRA:)
+Use check_keylen_blksize() to check whether the key length and block size are appropriate.
+For example, aes accepts key length 128,192,256 bits, and block size a multiple of 16 bytes.
+
+@MODULE
+(1) KEY:
+Module uses the key from the user-level to do the en/decryption, and hash the key into the preamble (preamble->check_key) using MD5.
+
+(2) PREAMBLE:
+struct cipher_preamble {
+	char check_key[MD5_DIGEST_SIZE];
+#ifdef EXTRA_CREDIT
+#define IV_SIZE 16
+	char iv[IV_SIZE];
+	int cipher_type;
+	int blk_size;
+#endif
+}
+The first 8 bytes of iv is the page number where we're doing encrypting;
+the second 8 bytes is the inode number of the output file.
+
+(3) OUTPUT FILE:
+
+0                  16    32           36           40
+---------------------------------------------------------------------------------
+| check_key(hashed) | IV | cipher type | block size | encrypted bytes | padding |
+---------------------------------------------------------------------------------
+
+(4) EN/DECRYPTION and PADDING
+Encryption,decryption and padding method come from the code in net/ceph/crypto.c
+Padding method:
+	size_t zero_padding = (0x10 - (src_len & 0x0f));
+	char pad[PAD_SIZE];//PAD_SIZE is 16 by default
+	memset(pad, zero_padding, zero_padding);
+So for example if (PAD_SIZE - src_len) is 0x0B, it pads 11 "0x0B"s -- "BBBBBBBBBBB".
+
+Module Program Flow
+-------------------
+- check the address of the argument passing to the module (using access_ok());
+- copy the arguments to the kernel;
+- check whether they are right arguments;
+- set preamble;
+- open the input file;
+- if it's decryption, check whether the input file contains the right key (with the right cipher),and also get the iv and the block size.
+- open the output file with flag O_CREAT, and set the permission to be S_IRUSR|S_IWUSR,
+  but don't truncate(you don't want to truncate an outfile if it is also an infile);
+- check whether input file and output are the same;
+- truncate the output file;
+- if it's encryption, set the iv in preamble;
+- initialize the cipher;
+- allocate input and output buffer;
+- start en/decryption;
+- if something goes wrong and there's a partial file, delete it.
+
+ERRNO
+-----
+I use default errno and default error messages in most cases, except that I use EDOM to indicate that en/decryption failed. I find a errno for invalid key that is EKEYREJECTED with the default message "Key was rejected by service". Other errno and messages should be straightforward.
